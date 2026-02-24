@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/functions.php';
+require_once __DIR__ . '/orchestrator.php';
 
 db();
 
@@ -11,9 +12,18 @@ if (!is_array($update) || empty($update)) {
     exit;
 }
 
-if (isset($update['message'])) {
-    handleMessage($update['message']);
-}
+    if (isset($update['message'])) {
+        $message = $update['message'];
+        $chatId = (int) ($message['chat']['id'] ?? 0);
+        $fromId = (int) ($message['from']['id'] ?? 0);
+
+        // Check if it's a message in the designated conversation group and from a bot
+        if ($chatId === CONVERSATION_GROUP_ID && isBot($fromId)) {
+            handleOrchestration($message);
+        } else {
+            handleMessage($message);
+        }
+    }
 
 if (isset($update['callback_query'])) {
     handleCallback($update['callback_query']);
@@ -59,6 +69,37 @@ function handleMessage(array $message): void
 
     if ($userId === ADMIN_ID && $text === '/myid') {
         sendMessage($chatId, 'ADMIN_ID: <code>' . ADMIN_ID . '</code>');
+        return;
+    }
+
+    if ($userId === ADMIN_ID && str_starts_with($text, '/addbot ')) {
+        $parts = explode(' ', $text);
+        if (count($parts) === 4) {
+            $botName = $parts[1];
+            $botToken = $parts[2];
+            $botId = (int) $parts[3];
+            addOrUpdateBotConfig($botName, $botToken, $botId);
+            sendMessage($chatId, "✅ تم إضافة البوت: {$botName}");
+        } else {
+            sendMessage($chatId, "❌ الاستخدام: /addbot [الاسم] [التوكن] [المعرف]");
+        }
+        return;
+    }
+
+    if ($userId === ADMIN_ID && $text === '/listbots') {
+        $bots = getBotsConfig();
+        $res = "🤖 قائمة البوتات:\n";
+        foreach ($bots as $b) {
+            $res .= "- {$b['bot_name']} (ID: {$b['bot_id']})\n";
+        }
+        sendMessage($chatId, $res);
+        return;
+    }
+
+    if ($userId === ADMIN_ID && str_starts_with($text, '/setgroup ')) {
+        $groupId = (int) substr($text, 10);
+        setSetting('conversation_group_id', (string) $groupId);
+        sendMessage($chatId, "✅ تم تحديد مجموعة المحادثة: {$groupId}");
         return;
     }
 

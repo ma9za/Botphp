@@ -80,15 +80,37 @@ function initDatabase(PDO $pdo): void
         created_at INTEGER NOT NULL
     )');
 
-    $pdo->exec('CREATE TABLE IF NOT EXISTS bot_commands (
+    $pdo->exec("CREATE TABLE IF NOT EXISTS bot_commands (
         command TEXT PRIMARY KEY,
-        action_type TEXT NOT NULL DEFAULT "new_message",
+        action_type TEXT NOT NULL DEFAULT \"new_message\",
         content_id INTEGER NULL,
-        content_ids TEXT NOT NULL DEFAULT "",
+        content_ids TEXT NOT NULL DEFAULT \"\",
         menu_target_id INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL
-    )');
-    $defaults = [
+    )");
+
+    $pdo->exec("CREATE TABLE IF NOT EXISTS bots_config (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bot_name TEXT NOT NULL UNIQUE,
+        bot_token TEXT NOT NULL,
+        bot_id INTEGER NOT NULL UNIQUE
+    )");
+
+    $pdo->exec("CREATE TABLE IF NOT EXISTS conversation_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        bot_id INTEGER NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        timestamp INTEGER NOT NULL
+    )");
+
+    $pdo->exec("CREATE TABLE IF NOT EXISTS conversation_state (
+        chat_id INTEGER PRIMARY KEY,
+        last_speaker_bot_id INTEGER NULL,
+        turn_order TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+    )"); $defaults = [
         'menu_message' => "مرحبًا بك 👋\nاختر من القائمة:",
         'force_join_message' => 'يجب الاشتراك في القنوات أولًا ثم اضغط تحقق.',
         'force_join_enabled' => '0',
@@ -979,4 +1001,181 @@ function getStats(): array
         'buttons' => (int) db()->query('SELECT COUNT(*) FROM buttons')->fetchColumn(),
         'contents' => (int) db()->query('SELECT COUNT(*) FROM content_items')->fetchColumn(),
     ];
+}
+
+function generic_http_post(string $url, array $headers, string $body): array
+{
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $error = curl_error($ch);
+    curl_close($ch);
+
+    if ($response === false) {
+        return ["ok" => false, "description" => "cURL Error: " . $error];
+    }
+
+    $decoded = json_decode($response, true);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        return ["ok" => false, "description" => "JSON Decode Error: " . json_last_error_msg(), "raw_response" => $response];
+    }
+
+    if ($httpCode !== 200) {
+        return ["ok" => false, "description" => "HTTP Error: " . $httpCode, "response" => $decoded];
+    }
+
+    return ["ok" => true, "response" => $decoded];
+}
+
+function deepseekApiCall(array $messages, string $model = "deepseek-chat"): array
+{
+    if (DEEPSEEK_API_KEY === "") {
+        return ["ok" => false, "description" => "DEEPSEEK_API_KEY is not set"];
+    }
+
+    $headers = [
+        "Content-Type: application/json",
+        "Authorization: Bearer " . DEEPSEEK_API_KEY,
+    ];
+
+    $payload = [
+        "model" => $model,
+        "messages" => $messages,
+        "stream" => false,
+    ];
+
+    $body = json_encode($payload, JSON_UNESCAPED_UNICODE);
+
+    return generic_http_post(DEEPSEEK_API_URL, $headers, $body);
+}
+
+
+function getBotIds(): array
+{
+    $pdo = db();
+    $stmt = $pdo->query("SELECT bot_id FROM bots_config");
+    return array_column($stmt->fetchAll(), 'bot_id');
+}
+
+function getBotTokenById(int $botId): ?string
+{
+    $pdo = db();
+    $stmt = $pdo->prepare("SELECT bot_token FROM bots_config WHERE bot_id = :bot_id");
+    $stmt->execute([':bot_id' => $botId]);
+    $result = $stmt->fetch();
+    return $result["bot_token"] ?? null;
+}
+
+function getConversationState(int $chatId): array
+{
+    $pdo = db();
+    $stmt = $pdo->prepare("SELECT last_speaker_bot_id, turn_order FROM conversation_state WHERE chat_id = :chat_id");
+    $stmt->execute([':chat_id' => $chatId]);
+    $state = $stmt->fetch();
+
+    if ($state === false) {
+        // Initialize state if not found
+        $botIds = getBotIds();
+        $initialTurnOrder = json_encode($botIds);
+        $initialLastSpeaker = !empty($botIds) ? $botIds[0] : null;
+
+        $stmt = $pdo->prepare("INSERT INTO conversation_state (chat_id, last_speaker_bot_id, turn_order, updated_at) VALUES (:chat_id, :last_speaker_bot_id, :turn_order, :updated_at)");
+        $stmt->execute([
+            ":chat_id" => $chatId,
+            ":last_speaker_bot_id" => $initialLastSpeaker,
+            ":turn_order" => $initialTurnOrder,
+            ":updated_at" => time(),
+        ]);
+        return [
+            "last_speaker_bot_id" => $initialLastSpeaker,
+            "turn_order" => $botIds,
+        ];
+    }
+
+    return [
+        "last_speaker_bot_id" => (int) $state["last_speaker_bot_id"],
+        "turn_order" => json_decode($state["turn_order"], true),
+    ];
+}
+
+function updateConversationState(int $chatId, int $lastSpeakerId): void
+{
+    $pdo = db();
+    $stmt = $pdo->prepare("UPDATE conversation_state SET last_speaker_bot_id = :last_speaker_bot_id, updated_at = :updated_at WHERE chat_id = :chat_id");
+    $stmt->execute([
+        ":last_speaker_bot_id" => $lastSpeakerId,
+        ":updated_at" => time(),
+        ":chat_id" => $chatId,
+    ]);
+}
+
+function getConversationHistory(int $chatId, int $botId, int $limit = 10): array
+{
+    $pdo = db();
+    $stmt = $pdo->prepare("SELECT role, content FROM conversation_history WHERE chat_id = :chat_id ORDER BY timestamp DESC LIMIT :limit");
+    $stmt->bindValue(":chat_id", $chatId, PDO::PARAM_INT);
+    $stmt->bindValue(":limit", $limit, PDO::PARAM_INT);
+    $stmt->execute();
+    $history = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    return array_reverse($history); // Return in chronological order
+}
+
+function addMessageToConversationHistory(int $chatId, int $botId, string $text, string $role): void
+{
+    $pdo = db();
+    $stmt = $pdo->prepare("INSERT INTO conversation_history (chat_id, bot_id, role, content, timestamp) VALUES (:chat_id, :bot_id, :role, :content, :timestamp)");
+    $stmt->execute([
+        ":chat_id" => $chatId,
+        ":bot_id" => $botId,
+        ":role" => $role,
+        ":content" => $text,
+        ":timestamp" => time(),
+    ]);
+}
+
+function getSetting(string $key, string $default = "): string
+{
+    $pdo = db();
+    $stmt = $pdo->prepare("SELECT value FROM settings WHERE key = :key");
+    $stmt->execute([':key' => $key]);
+    $result = $stmt->fetch();
+    return $result["value"] ?? $default;
+}
+
+function setSetting(string $key, string $value): void
+{
+    $pdo = db();
+    $stmt = $pdo->prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (:key, :value)");
+    $stmt->execute([':key' => $key, ':value' => $value]);
+}
+
+function addOrUpdateBotConfig(string $botName, string $botToken, int $botId): void
+{
+    $pdo = db();
+    $stmt = $pdo->prepare("INSERT OR REPLACE INTO bots_config (bot_name, bot_token, bot_id) VALUES (:bot_name, :bot_token, :bot_id)");
+    $stmt->execute([
+        ":bot_name" => $botName,
+        ":bot_token" => $botToken,
+        ":bot_id" => $botId,
+    ]);
+}
+
+function deleteBotConfig(int $botId): void
+{
+    $pdo = db();
+    $stmt = $pdo->prepare("DELETE FROM bots_config WHERE bot_id = :bot_id");
+    $stmt->execute([":bot_id" => $botId]);
+}
+
+function getBotsConfig(): array
+{
+    $pdo = db();
+    $stmt = $pdo->query("SELECT bot_name, bot_token, bot_id FROM bots_config");
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
 }
